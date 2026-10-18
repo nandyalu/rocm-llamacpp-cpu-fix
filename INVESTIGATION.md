@@ -60,6 +60,26 @@ Proof: we wrote a 0 to `/dev/cpu_dma_latency` and kept the file open. One card t
 
 Under load with seven cards the effect did not show: the pool-wide speed was the same as before (see the table).
 
+### The same cost on a new CPU (2026-10-18)
+
+We moved the host to an i7-11700T (8 cores, 16 threads, `intel_pstate`, governor `powersave`, energy preference `balance_performance`). Its idle states are POLL, C1_ACPI (1 µs) and C2_ACPI (253 µs). The cost came back, and the C-state fix did not remove it.
+
+Test: `llama-server` on one direct card, Gemma 4 E4B QAT with the MTP draft model, 128k context, f16 KV cache, `-t 1`. Each run sends the same 17.5k-token prompt with `cache_prompt: false` and a fixed seed, and generates 800 tokens. All runs gave the same tokens (452 of 1039 drafts accepted). There were three runs for each arm, and the spread was less than 1%. CPUs is the CPU time of the container divided by the request time.
+
+| Arm | Prompt tok/s | Generation tok/s | CPUs |
+|---|---|---|---|
+| No shims | 922-926 | 68.1-68.4 | 1.93 |
+| Both shims | 914 | 58.3 | 0.18 |
+| Both shims, `/dev/cpu_dma_latency` = 20 µs | 911 | 59.8 | 0.17 |
+| Both shims, energy preference `performance` | 928 | 67.0 | 0.10 |
+
+- **The 20 µs limit blocked C2 and did not help.** We counted 0 C2 entries in 3 s, and the speed went up by only 2.6%.
+- **The clock ramp is the cause on this CPU.** The idle cores ran at 800 to 1700 MHz. A thread that sleeps between GPU events wakes on a slow core, and `balance_performance` raises the clock too slowly. Without the shims, the spin loop keeps its core at full clock.
+- **The energy preference `performance` gives back almost all of the speed** (67.0 against 68.4 tok/s), at 19 times less CPU than no shims. C2 stays on.
+- **`-t 4` changed nothing**, with or without the shims (58.4 and 68.4 tok/s).
+
+We did not measure the idle power of the host with each energy preference, because RAPL needs root.
+
 A later check with the standard `llama-bench` (2026-10-10, one direct card, `-p 512 -n 128 -r 30`, build b11371) gave the same picture. Speed fell by about 5% for pp512 and 3% for tg128 (1161 to 1104 tok/s, 52.9 to 51.4 tok/s). CPU use of the container fell from 1.48 to 0.12 CPUs for pp512 and from 1.92 to 0.11 CPUs for tg128. The shim arm also had `HSA_ENABLE_SDMA=0`. The table and the method are in the README.
 
 We also tried `-t 1`, `-t 4` and `-t 8` on one card, first with the real server and a draft model, then with `llama-bench`. Speed and CPU use did not change in either test, with or without the shims (the table is in the README). With `-ngl 999` the CPU threads have almost no work, so we keep `-t 1`.
@@ -78,6 +98,25 @@ What we measured at a stall:
 - The VBIOS is not the cause. Six cards had one VBIOS and the seventh had another. Both stalled.
 
 We then tried the usual fixes for Navi 2x cards. With `HSA_ENABLE_SDMA=0` the next batch of 32 analyses had 0 kills, and so did the batch after it (which also had `LLAMA_ARG_BACKEND_SAMPLING=1`). Before, there were 2 to 5 kills in each batch. Two clean batches in a row are suggestive. They do not prove the cause, because the second batch changed two settings at once. If your stalls come back, test `HSA_ENABLE_SDMA=1` alone.
+
+## Test of `HSA_ENABLE_INTERRUPT=1` (2026-10-10)
+
+A reader said that `HSA_ENABLE_INTERRUPT=1` can replace the shims. We tested it. It has no effect, because `1` is already the ROCr default.
+
+Test: `llama-bench` (`-p 512 -n 128`, `-t 1`), one card, Gemma 4 E4B QAT, ROCm 7.2.1, 15 repetitions, two rounds. The three env-var arms have no shims. CPUs is the CPU time of the container divided by the test time.
+
+| Arm | pp512 tok/s | tg128 tok/s | CPUs, pp512 / tg128 |
+|---|---|---|---|
+| No shims | 1160-1169 | 52.8-53.0 | 1.06 / 1.92 |
+| No shims, `HSA_ENABLE_INTERRUPT=1` | 1157-1161 | 52.8-52.9 | 1.06 / 1.92 |
+| No shims, `HSA_ENABLE_INTERRUPT=0` (control) | 1158-1160 | 52.9 | 3.00 / 3.00 |
+| Both shims | 1097-1131 | 51.3-51.4 | 0.09-0.13 / 0.11 |
+
+- **`=1` gives the same result as no setting.** Speed and CPU use are equal.
+- **`=0` is the control.** It forces polling and raises CPU use to 3.00 CPUs. So the variable works, and interrupts were already on.
+- **Neither spin loop is a polling setting.** The main thread spins in the HIP (CLR) wait loop, and the events thread loops on the stale `last_event_age`. Only the shims fix these.
+
+We did not run this test with seven busy cards, because the result on one card is flat.
 
 ## Check of `tools/kfd_wait_trace.sh` (2026-10-10)
 

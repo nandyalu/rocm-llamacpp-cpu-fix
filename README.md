@@ -83,6 +83,12 @@ The shims act only in a process named `llama-server`. `llama bench` has another 
 
 **A cost:** the speed loss above is the CPU core going to sleep while it waits. A deep idle state (C2, 151 µs wake-up) slows each wake-up. In our own fixed-prompt test with the real model settings, one card alone generated 60 tok/s with both shims, against 70 tok/s without. With seven busy cards the pool speed did not change. To get the speed back on a single card, write 0 to `/dev/cpu_dma_latency` and keep the file open. We measured 69.5 tok/s that way. A limit of about 20 µs keeps C1 and blocks C2.
 
+**On another CPU the cause can be the clock ramp, not the C-state.** On an i7-11700T with `intel_pstate`, one card generated 58.3 tok/s with both shims and 68.4 tok/s without them. A 20 µs `/dev/cpu_dma_latency` limit gave only 59.8 tok/s. Set the energy preference to `performance` to get the speed back. We then measured 67.0 tok/s at 0.10 CPUs. To set it at each boot, put this line in `/etc/tmpfiles.d/cpu-epp.conf`:
+
+```
+w /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference - - - - performance
+```
+
 **Not tested:** other GPUs, other ROCm versions, other kernels, and CUDA. The kernel bug is in the ROCr call pattern, so a different ROCm version can change or remove it. If your CPU is not at 100% while the GPU works, you do not need this.
 
 ## Use it
